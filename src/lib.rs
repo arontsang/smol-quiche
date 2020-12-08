@@ -1,5 +1,6 @@
 
 use async_net::UdpSocket;
+use smol::channel::{Sender, Receiver, RecvError};
 use smol::lock::Mutex;
 use smol::LocalExecutor;
 use std::collections::HashMap;
@@ -14,8 +15,16 @@ type PinnedQuicConnection = Pin::<Box::<quiche::Connection>>;
 
 pub struct SmolQuic {
     connection: RcLock::<PinnedQuicConnection>,
-    dispatch_table: Rc::<Mutex::<HashMap::<u64, scheduler::RaiseEvent>>>,
+    dispatch_table: Rc::<Mutex::<HashMap::<u64, Sender<quiche::h3::Event>>>>,
+    received_packet_event_receiver: async_channel::Receiver::<()>,
     _task: smol::Task::<()>,
+}
+
+pub struct QuicClientRequest {
+    stream_id: u64,
+    stream_event_receiver: Receiver<quiche::h3::Event>,
+    connection: RcLock::<PinnedQuicConnection>,
+    http_client: RcLock::<quiche::h3::Connection>,
 }
 
 impl SmolQuic {
@@ -32,12 +41,11 @@ impl SmolQuic {
 
         let (send_packet_event_sender, send_packet_event_receiver) = scheduler::auto_reset_event();
         let (timeout_event_sender, timeout_event) = scheduler::auto_reset_event();
-        let (received_packet_event_sender, received_packet_event_receiver) = scheduler::auto_reset_event();
+        let (received_packet_event_sender, received_packet_event_receiver) = async_channel::bounded::<()>(1);
 
-        let dispatch_table = Rc::new(Mutex::new(HashMap::<u64, scheduler::RaiseEvent>::new()));
+        let dispatch_table = Rc::new(Mutex::new(HashMap::<u64, Sender<quiche::h3::Event>>::new()));
 
-        let task = {    
-            let dispatch_table = dispatch_table.clone();        
+        let task = {          
             let connection = connection.clone();
             scheduler.spawn(async move {
                 let socket = UdpSocket::bind("0.0.0.0:0").await;
@@ -50,7 +58,7 @@ impl SmolQuic {
                         {
                             let mut connection = connection.lock().await;
                             connection.on_timeout();
-                            send_packet_event_sender.Reset();
+                            send_packet_event_sender.reset();
                         }
                         loop {
                             let next_timeout = {
@@ -64,10 +72,10 @@ impl SmolQuic {
                                         let mut connection = connection.lock().await;
                                         connection.on_timeout();
                                     }
-                                    send_packet_event_sender.Reset();
+                                    send_packet_event_sender.reset();
                                 },
                                 None => {
-                                    timeout_event.WaitOnce().await;
+                                    timeout_event.wait_once().await;
                                 }
                             }
                         }
@@ -77,6 +85,7 @@ impl SmolQuic {
                 let _recv_loop = {
                     let socket = socket.clone();
                     let connection = connection.clone();
+                    let received_packet_event_sender = received_packet_event_sender.clone();
                     priority.spawn(scheduler::Priority::High, async move {
                         let mut recv_buffer: [u8; 1500] = [0; 1500];
                         let received_packet_event_sender = received_packet_event_sender.clone();
@@ -89,7 +98,9 @@ impl SmolQuic {
                                 let mut connection = connection.lock().await;
                                 connection.recv(&mut recv_buffer[0..length]).unwrap();
                             }
-                            received_packet_event_sender.Reset();
+                            match received_packet_event_sender.try_send(()) {
+                                _ => ()
+                            };
                         }
                     })
                 };
@@ -113,30 +124,8 @@ impl SmolQuic {
                                 }.unwrap();
         
                             }
-                            timeout_event_sender.Reset();
-                            send_packet_event_receiver.WaitOnce().await;
-                        }
-                    })
-                };
-
-                let _dispatch_receiver_task = {
-                    let dispatch_table = dispatch_table.clone();
-                    let connection = connection.clone();
-                    priority.spawn(scheduler::Priority::High, async move {
-                        loop {
-                            let readable = {
-                                let connection = connection.lock().await;
-                                connection.readable()
-                            };
-                            let dispatch_table = dispatch_table.lock().await;
-                            for stream_id in readable {
-                                match dispatch_table.get(&stream_id) {
-                                    Some(update) => update.Reset(),
-                                    None => (),
-                                };
-                            }
-
-                            received_packet_event_receiver.WaitOnce().await;
+                            timeout_event_sender.reset();
+                            send_packet_event_receiver.wait_once().await;
                         }
                     })
                 };
@@ -166,6 +155,7 @@ impl SmolQuic {
         let ret = SmolQuic{
             connection,
             dispatch_table,
+            received_packet_event_receiver,
             _task: task
         };
 
@@ -176,11 +166,12 @@ impl SmolQuic {
 pub struct SmolHttp3Client {
 
     connection: RcLock::<PinnedQuicConnection>,
-    http_client: quiche::h3::Connection,
+    http_client: RcLock::<quiche::h3::Connection>,
+    dispatch_table: Rc::<Mutex::<HashMap::<u64, Sender<quiche::h3::Event>>>>,
 }
 
 impl SmolHttp3Client {
-    pub async fn new(connection: SmolQuic) -> Result<SmolHttp3Client, quiche::h3::Error> {
+    pub async fn new(connection: SmolQuic, scheduler: &LocalExecutor<'_>) -> Result<SmolHttp3Client, quiche::h3::Error> {
         let mut h3_config = quiche::h3::Config::new()?;
         h3_config.set_max_header_list_size(128);
         h3_config.set_qpack_blocked_streams(100000);
@@ -190,11 +181,87 @@ impl SmolHttp3Client {
             let mut connection = connection.connection.lock().await;
             quiche::h3::Connection::with_transport(&mut connection, &h3_config)?
         };
+
+        let http_client = Rc::new(Mutex::new(http_client));
+
+        let _dispatching_task = {
+            let received_packet_event_receiver = connection.received_packet_event_receiver.clone();
+            let http_client = http_client.clone();
+            let dispatch_table = connection.dispatch_table.clone();
+            let connection = connection.connection.clone();
+            scheduler.spawn(async move {
+                loop {
+                    {
+                        let mut connection_state = connection.lock().await;
+                        let mut http_client = http_client.lock().await;
+                        let dispatch_table = dispatch_table.lock().await;
+                        loop {     
+                            match http_client.poll(&mut connection_state) {
+                                Err(_) => break,
+                                Ok((stream_id, evnt)) => {
+                                    if let Some(foo) = dispatch_table.get(&stream_id) {
+                                        foo.send(evnt).await.unwrap();
+                                    }
+                                }
+                            }
+                        }
+
+                        match received_packet_event_receiver.recv().await {
+                            _ => ()
+                        };
+                    }
+                }
+            })
+        };
+
         let ret = SmolHttp3Client{
             connection: connection.connection.clone(),
-            http_client: http_client
+            http_client: http_client,
+            dispatch_table: connection.dispatch_table.clone(),
         };
 
         Ok(ret)
+    }
+
+    pub async fn send_request<T: quiche::h3::NameValue>(
+        &mut self, 
+        headers: &[T],
+        
+    ) -> quiche::h3::Result<QuicClientRequest> {
+        let stream_id = {
+            let mut connection = self.connection.lock().await;
+            let mut http_client = self.http_client.lock().await;
+            http_client.send_request(&mut connection, &headers, true)?
+        };
+
+        
+        let (stream_event_sender, stream_event_receiver) = smol::channel::bounded::<quiche::h3::Event>(8);
+        {
+            let mut dispatch_table = self.dispatch_table.lock().await;
+            dispatch_table.insert(stream_id, stream_event_sender);
+        }
+
+        let ret = QuicClientRequest {
+            stream_id,
+            stream_event_receiver: stream_event_receiver,
+            connection: self.connection.clone(),
+            http_client: self.http_client.clone(),
+        };
+
+        Ok(ret)
+    }
+}
+
+impl QuicClientRequest {
+    pub async fn wait_events(&self) -> Result<quiche::h3::Event, RecvError> {
+        self.stream_event_receiver.recv().await
+    }
+
+    pub async fn read_body(&self, buffer: &mut [u8]) -> Result<usize, quiche::h3::Error> {
+        
+        let mut connection = self.connection.lock().await;
+        let mut http_client = self.http_client.lock().await;
+
+        http_client.recv_body(&mut connection, self.stream_id, buffer)
     }
 }

@@ -67,7 +67,7 @@ pub struct RaiseEvent {
 }
 
 impl RaiseEvent {
-    pub fn Reset(&self) -> () {
+    pub fn reset(&self) -> () {
         match self.resetter.try_send(()) {
             Ok(()) => (),
             Err(_) => (),
@@ -76,7 +76,7 @@ impl RaiseEvent {
 }
 
 impl Waiter {
-    pub async fn WaitOnce(&self) -> () {
+    pub async fn wait_once(&self) -> () {
         match self.waiter.recv().await {
             Ok(()) => (),
             Err(_) => (),
