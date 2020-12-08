@@ -172,3 +172,29 @@ impl SmolQuic {
         Ok(ret)
     }
 }
+
+pub struct SmolHttp3Client {
+
+    connection: RcLock::<PinnedQuicConnection>,
+    http_client: quiche::h3::Connection,
+}
+
+impl SmolHttp3Client {
+    pub async fn new(connection: SmolQuic) -> Result<SmolHttp3Client, quiche::h3::Error> {
+        let mut h3_config = quiche::h3::Config::new()?;
+        h3_config.set_max_header_list_size(128);
+        h3_config.set_qpack_blocked_streams(100000);
+        h3_config.set_qpack_max_table_capacity(16);
+
+        let http_client = {
+            let mut connection = connection.connection.lock().await;
+            quiche::h3::Connection::with_transport(&mut connection, &h3_config)?
+        };
+        let ret = SmolHttp3Client{
+            connection: connection.connection.clone(),
+            http_client: http_client
+        };
+
+        Ok(ret)
+    }
+}

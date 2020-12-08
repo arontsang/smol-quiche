@@ -1,7 +1,7 @@
 
 use smol::LocalExecutor;
 use std::sync::Arc;
-use smol_quiche::{SmolQuic};
+use smol_quiche::{SmolQuic, SmolHttp3Client};
 
 const MAX_DATAGRAM_SIZE: u64 = 1350;
 fn main() {
@@ -30,8 +30,11 @@ async fn main_async<'a>(scheduler: &LocalExecutor<'a>) -> quiche::Result<()> {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
-    let quic = SmolQuic::new(&mut config, &scheduler).await;
+    let quic: SmolQuic = SmolQuic::new(&mut config, &scheduler).await?;
 
+
+
+    let http_client = SmolHttp3Client::new(quic).await;
 
     Ok(())
 }
