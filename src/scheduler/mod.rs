@@ -61,7 +61,7 @@ pub struct Waiter {
     waiter: smol::channel::Receiver::<()>
 }
 
-#[derive(Clone)]
+
 pub struct RaiseEvent {
     resetter: smol::channel::Sender::<()>
 }
@@ -82,4 +82,11 @@ impl Waiter {
             Err(_) => (),
         }
     }
+}
+
+impl Clone for RaiseEvent {
+    
+    fn clone(&self) -> Self { 
+        RaiseEvent{ resetter: self.resetter.clone()}
+     }
 }
