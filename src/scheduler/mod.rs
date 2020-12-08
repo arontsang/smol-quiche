@@ -8,19 +8,18 @@ use futures_lite::{future, prelude::*};
 #[derive(Debug, Clone, Copy)]
 pub enum Priority {
     High = 0,
-    Medium = 1,
-    Low = 2,
+    Low = 1,
 }
 
 pub struct PriorityExecutor<'a> {
-    ex: [LocalExecutor<'a>; 3],
+    ex: [LocalExecutor<'a>; 2],
 }
 
 impl<'a> PriorityExecutor<'a> {
     /// Creates a new executor.
     pub const fn new() -> PriorityExecutor<'a> {
         PriorityExecutor {
-            ex: [LocalExecutor::new(), LocalExecutor::new(), LocalExecutor::new()],
+            ex: [LocalExecutor::new(), LocalExecutor::new()],
         }
     }
 
@@ -39,11 +38,10 @@ impl<'a> PriorityExecutor<'a> {
             for _ in 0..200 {
                 let t0 = self.ex[0].tick();
                 let t1 = self.ex[1].tick();
-                let t2 = self.ex[2].tick();
 
                 // Wait until one of the ticks completes, trying them in order from highest
                 // priority to lowest priority.
-                t0.or(t1).or(t2).await;
+                t0.or(t1).await;
             }
 
             // Yield every now and then.

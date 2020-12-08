@@ -1,6 +1,6 @@
 
 use async_net::UdpSocket;
-use crossfire::mpmc::{TxFuture, RxFuture, SharedFutureBoth};
+use crossfire::mpmc::{RxFuture, SharedFutureBoth};
 use smol::channel::{Sender, Receiver, RecvError};
 use smol::lock::Mutex;
 use smol::LocalExecutor;
@@ -34,7 +34,7 @@ impl SmolQuic {
 
     pub async fn new(config: &mut quiche::Config, scheduler: &LocalExecutor<'_>) -> Result<SmolQuic, quiche::Error> {
         
-        let destination: &str = "quic.tech";
+        let destination: &str = "dns.google";
         let destination: Option<&str> = Some(destination);
         let scid = [0xba; quiche::MAX_CONN_ID_LEN];
 
@@ -104,6 +104,17 @@ impl SmolQuic {
                             {
                                 let mut connection = connection.lock().await;
                                 connection.recv(&mut recv_buffer[0..length]).unwrap();
+                                loop {   
+                                    match smol::future::poll_once(socket.recv_from(&mut recv_buffer)).await {
+                                        None => break,
+                                        Some(Ok((length, _address))) => {
+                                            connection.recv(&mut recv_buffer[0..length]).unwrap();
+                                        },
+                                        Some(Err(_)) => break,                                        
+                                    }
+                                                                     
+                                }
+                                connection.on_timeout();
                             }
                             timeout_event_sender.reset();
 
@@ -118,7 +129,7 @@ impl SmolQuic {
                     let connection = connection.clone();
                     let timeout_event_sender = timeout_event_sender.clone();
                     priority.spawn(scheduler::Priority::High, async move {
-                        let destination = async_std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(45, 77, 96, 66)), 8443);
+                        let destination = async_std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)), 443);
         
                         let mut send_buffer: [u8; 1500] = [0; 1500];
                         loop {                            
@@ -134,7 +145,7 @@ impl SmolQuic {
                                     Err(quiche::Error::Done) => break 'send_loop,                               
                                     Err(_) => break 'send_loop,
                                 };
-        
+                                connection.on_timeout();        
                             }
                             timeout_event_sender.reset();
                             send_packet_event_receiver.wait_once().await;
@@ -243,7 +254,7 @@ impl SmolHttp3Client {
                     }
                     
                     match received_packet_event_receiver.recv().await {
-                        Err(x) => {
+                        Err(_) => {
                             ()
                         },
                         _ => ()

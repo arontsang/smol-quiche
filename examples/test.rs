@@ -1,4 +1,4 @@
-
+use std::time::Instant;
 use smol::LocalExecutor;
 use std::sync::Arc;
 use smol_quiche::{SmolQuic, SmolHttp3Client};
@@ -38,11 +38,12 @@ async fn main_async<'a>(scheduler: &LocalExecutor<'a>) -> quiche::Result<()> {
         let req = vec![
             quiche::h3::Header::new(":method", "GET"),
             quiche::h3::Header::new(":scheme", "https"),
-            quiche::h3::Header::new(":authority", "quic.tech"),
+            quiche::h3::Header::new(":authority", "dns.google"),
             quiche::h3::Header::new(":path", "/"),
             quiche::h3::Header::new("user-agent", "quiche"),
         ];
     
+        let start = Instant::now();
         let request = http_client.send_request(&req).await.unwrap();
 
         scheduler.run(async{
@@ -66,6 +67,8 @@ async fn main_async<'a>(scheduler: &LocalExecutor<'a>) -> quiche::Result<()> {
                             Ok(length) => {
                                 let body = std::str::from_utf8(&buffer[0..length]).unwrap();
                                 println!("{}", body);
+                                let duration = start.elapsed();
+                                println!("Time elapsed in expensive_function() is: {:?}", duration);
                             },
                             Err(quiche::h3::Error::Done) => (),
                             Err(er) =>
