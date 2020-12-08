@@ -2,6 +2,7 @@
 use async_net::UdpSocket;
 use smol::lock::Mutex;
 use smol::LocalExecutor;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::net::{IpAddr, Ipv4Addr};
@@ -13,6 +14,7 @@ type PinnedQuicConnection = Pin::<Box::<quiche::Connection>>;
 
 pub struct SmolQuic {
     connection: RcLock::<PinnedQuicConnection>,
+    dispatch_table: Rc::<Mutex::<HashMap::<u64, scheduler::RaiseEvent>>>,
     _task: smol::Task::<()>,
 }
 
@@ -32,7 +34,10 @@ impl SmolQuic {
         let (timeout_event_sender, timeout_event) = scheduler::auto_reset_event();
         let (received_packet_event_sender, received_packet_event_receiver) = scheduler::auto_reset_event();
 
-        let task = {            
+        let dispatch_table = Rc::new(Mutex::new(HashMap::<u64, scheduler::RaiseEvent>::new()));
+
+        let task = {    
+            let dispatch_table = dispatch_table.clone();        
             let connection = connection.clone();
             scheduler.spawn(async move {
                 let socket = UdpSocket::bind("0.0.0.0:0").await;
@@ -92,7 +97,7 @@ impl SmolQuic {
                 let _send_loop = {
                     let socket = socket.clone();
                     let connection = connection.clone();
-                    priority.spawn(scheduler::Priority::High, async move {
+                    priority.spawn(scheduler::Priority::Medium, async move {
                         let destination = async_std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443);
         
                         let mut send_buffer: [u8; 1500] = [0; 1500];
@@ -110,6 +115,28 @@ impl SmolQuic {
                             }
                             timeout_event_sender.Reset();
                             send_packet_event_receiver.WaitOnce().await;
+                        }
+                    })
+                };
+
+                let _dispatch_receiver_task = {
+                    let dispatch_table = dispatch_table.clone();
+                    let connection = connection.clone();
+                    priority.spawn(scheduler::Priority::High, async move {
+                        loop {
+                            let readable = {
+                                let connection = connection.lock().await;
+                                connection.readable()
+                            };
+                            let dispatch_table = dispatch_table.lock().await;
+                            for stream_id in readable {
+                                match dispatch_table.get(&stream_id) {
+                                    Some(update) => update.Reset(),
+                                    None => (),
+                                };
+                            }
+
+                            received_packet_event_receiver.WaitOnce().await;
                         }
                     })
                 };
@@ -138,6 +165,7 @@ impl SmolQuic {
 
         let ret = SmolQuic{
             connection,
+            dispatch_table,
             _task: task
         };
 
